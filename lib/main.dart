@@ -1,12 +1,3 @@
-// pubspec.yaml dependencies:
-// dependencies:
-//   flutter:
-//     sdk: flutter
-//   camera: ^0.10.5+5
-//   google_mlkit_pose_detection: ^0.5.0
-//   permission_handler: ^11.0.1
-//   flutter_tts: ^3.8.3
-
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
@@ -137,7 +128,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
         _feedback = "Starting camera...";
       });
       
-      await _initializeCamera();
+      await _initializeCameraWithFallback();
       
     } catch (e) {
       setState(() {
@@ -177,7 +168,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
   Future<void> _initializePoseDetection() async {
     try {
       final options = PoseDetectorOptions(
-        model: PoseDetectionModel.base, // Use base model for better performance
+        model: PoseDetectionModel.base,
         mode: PoseDetectionMode.stream,
       );
       _poseDetector = PoseDetector(options: options);
@@ -191,7 +182,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     }
   }
 
-  Future<void> _initializeCamera() async {
+  Future<void> _initializeCameraWithFallback() async {
     if (widget.cameras.isEmpty) {
       throw Exception("No cameras available");
     }
@@ -205,31 +196,31 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       
       // Try different image format groups for better compatibility
       final formatGroups = [
-        ImageFormatGroup.nv21,
-        ImageFormatGroup.yuv420,
-        ImageFormatGroup.bgra8888,
+        ImageFormatGroup.nv21,      // Android preferred
+        ImageFormatGroup.yuv420,    // Cross-platform
+        ImageFormatGroup.bgra8888,  // iOS preferred
       ];
       
-      bool cameraInitialized = false;
-      Exception? lastException;
+      Exception? lastError;
       
-      for (final formatGroup in formatGroups) {
+      for (final format in formatGroups) {
         try {
-          await _setupCameraWithFormat(_currentCameraIndex, formatGroup);
-          cameraInitialized = true;
+          await _setupCameraWithFormat(_currentCameraIndex, format);
+          
           setState(() {
-            _debugInfo += "\nCamera: Initialized with ${formatGroup.name} (${widget.cameras[_currentCameraIndex].lensDirection.name})";
+            _debugInfo += "\nCamera initialized with: ${format.name} (${widget.cameras[_currentCameraIndex].lensDirection.name})";
           });
-          break;
+          
+          break; // Success
         } catch (e) {
-          lastException = e as Exception?;
-          print("Failed to initialize camera with ${formatGroup.name}: $e");
+          lastError = e as Exception?;
+          print("Failed with ${format.name}: $e");
           continue;
         }
       }
       
-      if (!cameraInitialized) {
-        throw lastException ?? Exception("Failed to initialize camera with any format");
+      if (_cameraController == null || !_cameraController!.value.isInitialized) {
+        throw lastError ?? Exception("All camera formats failed");
       }
       
       if (!mounted) return;
@@ -260,6 +251,9 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     );
 
     await _cameraController!.initialize();
+    
+    // Add a small delay to ensure proper initialization
+    await Future.delayed(const Duration(milliseconds: 100));
   }
 
   int _findCameraIndex(CameraLensDirection direction) {
@@ -269,19 +263,6 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       }
     }
     return -1;
-  }
-
-  Future<void> _setupCamera(int cameraIndex) async {
-    await _cameraController?.dispose();
-    
-    _cameraController = CameraController(
-      widget.cameras[cameraIndex],
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21, // Use nv21 for better compatibility
-    );
-
-    await _cameraController!.initialize();
   }
 
   Future<void> _switchCamera() async {
@@ -385,6 +366,14 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
 
   Future<void> _processImage(CameraImage image) async {
     try {
+      // Skip frames to reduce processing load
+      int frameCount = 0;
+      frameCount++;
+      if (frameCount % 3 != 0) { // Process every 3rd frame only
+        _isProcessing = false;
+        return;
+      }
+
       final inputImage = _inputImageFromCameraImage(image);
       if (inputImage == null) {
         _isProcessing = false;
@@ -396,7 +385,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       if (mounted && poses != null) {
         setState(() {
           _poses = poses;
-          _debugInfo = "Poses detected: ${poses.length} | Format: ${image.format.raw}";
+          _debugInfo = "Poses: ${poses.length} | Format: ${image.format.group.name}";
         });
         
         _analyzePose();
@@ -407,9 +396,9 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
         _debugInfo += "\nProcessing error: $e";
       });
       
-      // If we get repeated processing errors, try to restart the image stream
-      if (e.toString().contains('format') || e.toString().contains('null')) {
-        print('Image format error detected, attempting to restart image stream...');
+      // Handle format errors by trying to restart
+      if (e.toString().toLowerCase().contains('format') || 
+          e.toString().toLowerCase().contains('convert')) {
         _restartImageStreamWithDelay();
       }
     } finally {
@@ -433,85 +422,59 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     try {
       final camera = widget.cameras[_currentCameraIndex];
       final sensorOrientation = camera.sensorOrientation;
-      InputImageRotation? rotation;
+      InputImageRotation rotation = InputImageRotation.rotation0deg;
       
-      // Determine rotation based on device orientation and camera
-      if (camera.lensDirection == CameraLensDirection.front) {
-        switch (sensorOrientation) {
-          case 90:
-            rotation = InputImageRotation.rotation270deg;
-            break;
-          case 180:
-            rotation = InputImageRotation.rotation180deg;
-            break;
-          case 270:
-            rotation = InputImageRotation.rotation90deg;
-            break;
-          default:
-            rotation = InputImageRotation.rotation0deg;
-        }
-      } else {
-        switch (sensorOrientation) {
-          case 90:
-            rotation = InputImageRotation.rotation90deg;
-            break;
-          case 180:
-            rotation = InputImageRotation.rotation180deg;
-            break;
-          case 270:
-            rotation = InputImageRotation.rotation270deg;
-            break;
-          default:
-            rotation = InputImageRotation.rotation0deg;
-        }
+      // Determine rotation based on sensor orientation
+      switch (sensorOrientation) {
+        case 90:
+          rotation = camera.lensDirection == CameraLensDirection.front
+              ? InputImageRotation.rotation270deg
+              : InputImageRotation.rotation90deg;
+          break;
+        case 180:
+          rotation = InputImageRotation.rotation180deg;
+          break;
+        case 270:
+          rotation = camera.lensDirection == CameraLensDirection.front
+              ? InputImageRotation.rotation90deg
+              : InputImageRotation.rotation270deg;
+          break;
+        default:
+          rotation = InputImageRotation.rotation0deg;
       }
 
-      // Handle different image formats with fallback
-      InputImageFormat? format;
-      
-      // Try to get format from raw value
-      try {
-        format = InputImageFormatValue.fromRawValue(image.format.raw);
-      } catch (e) {
-        print('Failed to get format from raw value: $e');
-      }
-      
-      // If format is null, try common formats based on platform
-      if (format == null) {
-        // Common formats for Android/iOS
-        switch (image.format.raw) {
-          case 35: // ImageFormat.YUV_420_888 on Android
+      // Fixed format handling - use direct mapping instead of fromRawValue
+      InputImageFormat format;
+      switch (image.format.group) {
+        case ImageFormatGroup.yuv420:
+          format = InputImageFormat.yuv420;
+          break;
+        case ImageFormatGroup.bgra8888:
+          format = InputImageFormat.bgra8888;
+          break;
+        case ImageFormatGroup.nv21:
+          format = InputImageFormat.nv21;
+          break;
+        default:
+          // Fallback based on raw format values
+          if (image.format.raw == 35) { // YUV_420_888
             format = InputImageFormat.yuv420;
-            break;
-          case 17: // ImageFormat.NV21 on Android
+          } else if (image.format.raw == 17) { // NV21
             format = InputImageFormat.nv21;
-            break;
-          case 842094169: // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange on iOS
+          } else {
+            print('Unsupported format: ${image.format.raw}, defaulting to YUV420');
             format = InputImageFormat.yuv420;
-            break;
-          case 875704422: // kCVPixelFormatType_420YpCbCr8BiPlanarFullRange on iOS
-            format = InputImageFormat.yuv420;
-            break;
-          default:
-            print('Unsupported image format: ${image.format.raw}');
-            // Try to use YUV420 as fallback
-            format = InputImageFormat.yuv420;
-        }
+          }
       }
 
-      if (image.planes.isEmpty) {
-        print('No image planes available');
+      // Validate image data
+      if (image.planes.isEmpty || image.planes.first.bytes.isEmpty) {
+        print('Invalid image data - no planes or empty bytes');
         return null;
       }
 
       final plane = image.planes.first;
       
-      // Validate plane data
-      if (plane.bytes.isEmpty) {
-        print('Empty plane bytes');
-        return null;
-      }
-
       return InputImage.fromBytes(
         bytes: plane.bytes,
         metadata: InputImageMetadata(
@@ -523,9 +486,6 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       );
     } catch (e) {
       print('Error creating InputImage: $e');
-      setState(() {
-        _debugInfo += "\nInputImage error: $e";
-      });
       return null;
     }
   }
