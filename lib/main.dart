@@ -77,6 +77,10 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
   String _lastSpokenFeedback = "";
   int _correctPoseCount = 0;
   
+  // Camera management
+  int _currentCameraIndex = 0;
+  bool _isSwitchingCamera = false;
+  
   // Initialization states
   bool _cameraInitialized = false;
   bool _poseDetectorInitialized = false;
@@ -193,30 +197,20 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     }
     
     try {
-      // Try front camera first, then back camera
-      CameraDescription selectedCamera = widget.cameras.first;
-      for (final camera in widget.cameras) {
-        if (camera.lensDirection == CameraLensDirection.front) {
-          selectedCamera = camera;
-          break;
-        }
+      // Find initial camera (prefer front camera)
+      _currentCameraIndex = _findCameraIndex(CameraLensDirection.front);
+      if (_currentCameraIndex == -1) {
+        _currentCameraIndex = 0; // Use first available camera
       }
       
-      _cameraController = CameraController(
-        selectedCamera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420, // Ensure compatible format
-      );
-
-      await _cameraController!.initialize();
+      await _setupCamera(_currentCameraIndex);
       
       if (!mounted) return;
       
       _cameraInitialized = true;
       
       setState(() {
-        _debugInfo += "\nCamera: Initialized (${selectedCamera.lensDirection.name})";
+        _debugInfo += "\nCamera: Initialized (${widget.cameras[_currentCameraIndex].lensDirection.name})";
         _feedback = "Ready! Position yourself in Child's Pose";
       });
       
@@ -229,6 +223,78 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     }
   }
 
+  int _findCameraIndex(CameraLensDirection direction) {
+    for (int i = 0; i < widget.cameras.length; i++) {
+      if (widget.cameras[i].lensDirection == direction) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  Future<void> _setupCamera(int cameraIndex) async {
+    await _cameraController?.dispose();
+    
+    _cameraController = CameraController(
+      widget.cameras[cameraIndex],
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420, // Ensure compatible format
+    );
+
+    await _cameraController!.initialize();
+  }
+
+  Future<void> _switchCamera() async {
+    if (widget.cameras.length <= 1 || _isSwitchingCamera) return;
+    
+    setState(() {
+      _isSwitchingCamera = true;
+      _feedback = "Switching camera...";
+    });
+
+    try {
+      // Stop current image stream
+      await _cameraController?.stopImageStream();
+      
+      // Find next camera
+      final currentDirection = widget.cameras[_currentCameraIndex].lensDirection;
+      final targetDirection = currentDirection == CameraLensDirection.front 
+          ? CameraLensDirection.back 
+          : CameraLensDirection.front;
+      
+      int nextIndex = _findCameraIndex(targetDirection);
+      if (nextIndex == -1) {
+        // If target direction not found, just use next available camera
+        nextIndex = (_currentCameraIndex + 1) % widget.cameras.length;
+      }
+      
+      _currentCameraIndex = nextIndex;
+      
+      // Setup new camera
+      await _setupCamera(_currentCameraIndex);
+      
+      setState(() {
+        _debugInfo += "\nSwitched to: ${widget.cameras[_currentCameraIndex].lensDirection.name}";
+        _feedback = "Camera switched. Ready for Child's Pose";
+      });
+      
+      // Restart image stream
+      await Future.delayed(const Duration(milliseconds: 500));
+      _startImageStream();
+      
+    } catch (e) {
+      setState(() {
+        _errorMessage = "Failed to switch camera: $e";
+        _feedback = _errorMessage;
+      });
+    } finally {
+      setState(() {
+        _isSwitchingCamera = false;
+      });
+    }
+  }
+
   void _startImageStream() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       return;
@@ -236,7 +302,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     
     try {
       _cameraController!.startImageStream((image) {
-        if (!_isProcessing && _poseDetector != null) {
+        if (!_isProcessing && _poseDetector != null && !_isSwitchingCamera) {
           _isProcessing = true;
           _processImage(image);
         }
@@ -284,11 +350,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
 
   InputImage? _inputImageFromCameraImage(CameraImage image) {
     try {
-      final camera = widget.cameras.firstWhere(
-        (cam) => cam.lensDirection == (_cameraController?.description.lensDirection ?? CameraLensDirection.back),
-        orElse: () => widget.cameras.first,
-      );
-      
+      final camera = widget.cameras[_currentCameraIndex];
       final sensorOrientation = camera.sensorOrientation;
       InputImageRotation? rotation;
       
@@ -560,6 +622,23 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         actions: [
+          // Camera flip button
+          if (widget.cameras.length > 1)
+            IconButton(
+              icon: _isSwitchingCamera 
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      ),
+                    )
+                  : const Icon(Icons.flip_camera_ios),
+              onPressed: _isSwitchingCamera ? null : _switchCamera,
+              tooltip: 'Switch Camera',
+            ),
+          // Sound toggle button
           IconButton(
             icon: Icon(_soundEnabled ? Icons.volume_up : Icons.volume_off),
             onPressed: () {
@@ -567,6 +646,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
                 _soundEnabled = !_soundEnabled;
               });
             },
+            tooltip: 'Toggle Sound',
           ),
         ],
       ),
@@ -602,6 +682,24 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
                 ),
               ),
             ),
+
+          // Camera indicator
+          Positioned(
+            top: 80,
+            right: 20,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.7),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                widget.cameras[_currentCameraIndex].lensDirection == CameraLensDirection.front 
+                    ? "Front" : "Back",
+                style: const TextStyle(color: Colors.white, fontSize: 12),
+              ),
+            ),
+          ),
 
           // Feedback Panel
           Positioned(
