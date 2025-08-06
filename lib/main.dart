@@ -17,11 +17,41 @@ import 'dart:async';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final cameras = await availableCameras();
-  runApp(MaterialApp(
-    home: ChildsPoseDetectionApp(cameras: cameras),
-    debugShowCheckedModeBanner: false,
-  ));
+  
+  try {
+    final cameras = await availableCameras();
+    runApp(MaterialApp(
+      home: ChildsPoseDetectionApp(cameras: cameras),
+      debugShowCheckedModeBanner: false,
+    ));
+  } catch (e) {
+    runApp(MaterialApp(
+      home: ErrorScreen(error: "Failed to get cameras: $e"),
+      debugShowCheckedModeBanner: false,
+    ));
+  }
+}
+
+class ErrorScreen extends StatelessWidget {
+  final String error;
+  const ErrorScreen({Key? key, required this.error}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Text(
+            error,
+            style: const TextStyle(color: Colors.white, fontSize: 16),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class ChildsPoseDetectionApp extends StatefulWidget {
@@ -42,9 +72,17 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
   bool _isProcessing = false;
   bool _soundEnabled = true;
   String _feedback = "Initializing...";
+  String _debugInfo = "";
   DateTime _lastTTSTime = DateTime.now();
   String _lastSpokenFeedback = "";
   int _correctPoseCount = 0;
+  
+  // Initialization states
+  bool _cameraInitialized = false;
+  bool _poseDetectorInitialized = false;
+  bool _permissionsGranted = false;
+  bool _hasError = false;
+  String _errorMessage = "";
 
   // Pose analysis parameters (normalized for Flutter coordinates)
   static const Map<String, dynamic> IDEAL = {
@@ -72,109 +110,252 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
   }
 
   Future<void> _initializeServices() async {
-    await _requestPermissions();
-    await _initializeTTS();
-    await _initializePoseDetection();
-    await _initializeCamera();
+    try {
+      setState(() {
+        _feedback = "Requesting permissions...";
+      });
+      
+      await _requestPermissions();
+      
+      setState(() {
+        _feedback = "Initializing pose detection...";
+      });
+      
+      await _initializePoseDetection();
+      
+      setState(() {
+        _feedback = "Initializing text-to-speech...";
+      });
+      
+      await _initializeTTS();
+      
+      setState(() {
+        _feedback = "Starting camera...";
+      });
+      
+      await _initializeCamera();
+      
+    } catch (e) {
+      setState(() {
+        _hasError = true;
+        _errorMessage = "Initialization failed: $e";
+        _feedback = _errorMessage;
+      });
+    }
   }
 
   Future<void> _requestPermissions() async {
-    await [Permission.camera, Permission.microphone].request();
+    final cameraStatus = await Permission.camera.request();
+    final microphoneStatus = await Permission.microphone.request();
+    
+    _permissionsGranted = cameraStatus.isGranted;
+    
+    setState(() {
+      _debugInfo = "Camera: ${cameraStatus.name}, Microphone: ${microphoneStatus.name}";
+    });
+    
+    if (!cameraStatus.isGranted) {
+      throw Exception("Camera permission denied");
+    }
   }
 
   Future<void> _initializeTTS() async {
-    _flutterTts = FlutterTts();
-    await _flutterTts?.setLanguage("en-US");
-    await _flutterTts?.setSpeechRate(0.8);
+    try {
+      _flutterTts = FlutterTts();
+      await _flutterTts?.setLanguage("en-US");
+      await _flutterTts?.setSpeechRate(0.8);
+    } catch (e) {
+      print("TTS initialization failed: $e");
+      // Continue without TTS
+    }
   }
 
   Future<void> _initializePoseDetection() async {
-    final options = PoseDetectorOptions(
-      model: PoseDetectionModel.accurate,
-      mode: PoseDetectionMode.stream,
-    );
-    _poseDetector = PoseDetector(options: options);
+    try {
+      final options = PoseDetectorOptions(
+        model: PoseDetectionModel.base, // Use base model for better performance
+        mode: PoseDetectionMode.stream,
+      );
+      _poseDetector = PoseDetector(options: options);
+      _poseDetectorInitialized = true;
+      
+      setState(() {
+        _debugInfo += "\nPose detector: Initialized";
+      });
+    } catch (e) {
+      throw Exception("Failed to initialize pose detector: $e");
+    }
   }
 
   Future<void> _initializeCamera() async {
-    if (widget.cameras.isEmpty) return;
+    if (widget.cameras.isEmpty) {
+      throw Exception("No cameras available");
+    }
     
-    _cameraController = CameraController(
-      widget.cameras.first,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
+    try {
+      // Try front camera first, then back camera
+      CameraDescription selectedCamera = widget.cameras.first;
+      for (final camera in widget.cameras) {
+        if (camera.lensDirection == CameraLensDirection.front) {
+          selectedCamera = camera;
+          break;
+        }
+      }
+      
+      _cameraController = CameraController(
+        selectedCamera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420, // Ensure compatible format
+      );
 
-    await _cameraController?.initialize();
-    if (mounted) {
-      setState(() {});
+      await _cameraController!.initialize();
+      
+      if (!mounted) return;
+      
+      _cameraInitialized = true;
+      
+      setState(() {
+        _debugInfo += "\nCamera: Initialized (${selectedCamera.lensDirection.name})";
+        _feedback = "Ready! Position yourself in Child's Pose";
+      });
+      
+      // Start processing after a short delay
+      await Future.delayed(const Duration(milliseconds: 500));
       _startImageStream();
+      
+    } catch (e) {
+      throw Exception("Failed to initialize camera: $e");
     }
   }
 
   void _startImageStream() {
-    _cameraController?.startImageStream((image) {
-      if (!_isProcessing) {
-        _isProcessing = true;
-        _processImage(image);
-      }
-    });
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return;
+    }
+    
+    try {
+      _cameraController!.startImageStream((image) {
+        if (!_isProcessing && _poseDetector != null) {
+          _isProcessing = true;
+          _processImage(image);
+        }
+      });
+      
+      setState(() {
+        _debugInfo += "\nImage stream: Started";
+      });
+      
+    } catch (e) {
+      setState(() {
+        _errorMessage = "Failed to start image stream: $e";
+        _feedback = _errorMessage;
+      });
+    }
   }
 
   Future<void> _processImage(CameraImage image) async {
     try {
       final inputImage = _inputImageFromCameraImage(image);
-      if (inputImage != null) {
-        final poses = await _poseDetector?.processImage(inputImage);
-        if (mounted && poses != null) {
-          setState(() {
-            _poses = poses;
-            _analyzePose();
-          });
-        }
+      if (inputImage == null) {
+        _isProcessing = false;
+        return;
+      }
+
+      final poses = await _poseDetector?.processImage(inputImage);
+      
+      if (mounted && poses != null) {
+        setState(() {
+          _poses = poses;
+          _debugInfo = "Poses detected: ${poses.length}";
+        });
+        
+        _analyzePose();
       }
     } catch (e) {
       print('Error processing image: $e');
+      setState(() {
+        _debugInfo += "\nProcessing error: $e";
+      });
     } finally {
       _isProcessing = false;
     }
   }
 
   InputImage? _inputImageFromCameraImage(CameraImage image) {
-    final camera = widget.cameras.first;
-    final sensorOrientation = camera.sensorOrientation;
-    
-    InputImageRotation? rotation;
-    if (sensorOrientation == 90) {
-      rotation = InputImageRotation.rotation90deg;
-    } else if (sensorOrientation == 180) {
-      rotation = InputImageRotation.rotation180deg;
-    } else if (sensorOrientation == 270) {
-      rotation = InputImageRotation.rotation270deg;
-    } else {
-      rotation = InputImageRotation.rotation0deg;
+    try {
+      final camera = widget.cameras.firstWhere(
+        (cam) => cam.lensDirection == (_cameraController?.description.lensDirection ?? CameraLensDirection.back),
+        orElse: () => widget.cameras.first,
+      );
+      
+      final sensorOrientation = camera.sensorOrientation;
+      InputImageRotation? rotation;
+      
+      // Determine rotation based on device orientation and camera
+      if (camera.lensDirection == CameraLensDirection.front) {
+        switch (sensorOrientation) {
+          case 90:
+            rotation = InputImageRotation.rotation270deg;
+            break;
+          case 180:
+            rotation = InputImageRotation.rotation180deg;
+            break;
+          case 270:
+            rotation = InputImageRotation.rotation90deg;
+            break;
+          default:
+            rotation = InputImageRotation.rotation0deg;
+        }
+      } else {
+        switch (sensorOrientation) {
+          case 90:
+            rotation = InputImageRotation.rotation90deg;
+            break;
+          case 180:
+            rotation = InputImageRotation.rotation180deg;
+            break;
+          case 270:
+            rotation = InputImageRotation.rotation270deg;
+            break;
+          default:
+            rotation = InputImageRotation.rotation0deg;
+        }
+      }
+
+      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+      if (format == null) {
+        print('Unsupported image format: ${image.format.raw}');
+        return null;
+      }
+
+      if (image.planes.isEmpty) {
+        print('No image planes available');
+        return null;
+      }
+
+      final plane = image.planes.first;
+
+      return InputImage.fromBytes(
+        bytes: plane.bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: format,
+          bytesPerRow: plane.bytesPerRow,
+        ),
+      );
+    } catch (e) {
+      print('Error creating InputImage: $e');
+      return null;
     }
-
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
-
-    if (image.planes.length != 1) return null;
-    final plane = image.planes.first;
-
-    return InputImage.fromBytes(
-      bytes: plane.bytes,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: plane.bytesPerRow,
-      ),
-    );
   }
 
   void _analyzePose() {
     if (_poses.isEmpty) {
-      _feedback = "No person detected.";
+      setState(() {
+        _feedback = "No person detected. Please step into camera view.";
+      });
       _lastSpokenFeedback = "";
       _correctPoseCount = 0;
       return;
@@ -183,33 +364,50 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     final pose = _poses.first;
     final landmarks = pose.landmarks;
     
-    // Get key landmarks
-    final leftHip = landmarks[PoseLandmarkType.leftHip];
-    final rightHip = landmarks[PoseLandmarkType.rightHip];
-    final leftKnee = landmarks[PoseLandmarkType.leftKnee];
-    final rightKnee = landmarks[PoseLandmarkType.rightKnee];
-    final leftAnkle = landmarks[PoseLandmarkType.leftAnkle];
-    final rightAnkle = landmarks[PoseLandmarkType.rightAnkle];
-    final leftHeel = landmarks[PoseLandmarkType.leftHeel];
-    final rightHeel = landmarks[PoseLandmarkType.rightHeel];
-    final leftShoulder = landmarks[PoseLandmarkType.leftShoulder];
-    final rightShoulder = landmarks[PoseLandmarkType.rightShoulder];
-    final leftWrist = landmarks[PoseLandmarkType.leftWrist];
-    final rightWrist = landmarks[PoseLandmarkType.rightWrist];
-    final nose = landmarks[PoseLandmarkType.nose];
+    // Check if we have the required landmarks
+    final requiredLandmarks = [
+      PoseLandmarkType.leftHip,
+      PoseLandmarkType.rightHip,
+      PoseLandmarkType.leftKnee,
+      PoseLandmarkType.rightKnee,
+      PoseLandmarkType.leftAnkle,
+      PoseLandmarkType.rightAnkle,
+      PoseLandmarkType.leftShoulder,
+      PoseLandmarkType.rightShoulder,
+      PoseLandmarkType.nose,
+    ];
 
-    if (leftHip == null || rightHip == null || leftKnee == null || rightKnee == null ||
-        leftAnkle == null || rightAnkle == null || leftShoulder == null || rightShoulder == null ||
-        nose == null) {
-      _feedback = "Cannot detect all required body parts.";
+    bool hasAllLandmarks = true;
+    for (final landmarkType in requiredLandmarks) {
+      if (landmarks[landmarkType] == null) {
+        hasAllLandmarks = false;
+        break;
+      }
+    }
+
+    if (!hasAllLandmarks) {
+      setState(() {
+        _feedback = "Cannot detect all required body parts. Please ensure your whole body is visible.";
+      });
       return;
     }
+
+    // Get landmarks
+    final leftHip = landmarks[PoseLandmarkType.leftHip]!;
+    final rightHip = landmarks[PoseLandmarkType.rightHip]!;
+    final leftKnee = landmarks[PoseLandmarkType.leftKnee]!;
+    final rightKnee = landmarks[PoseLandmarkType.rightKnee]!;
+    final leftAnkle = landmarks[PoseLandmarkType.leftAnkle]!;
+    final rightAnkle = landmarks[PoseLandmarkType.rightAnkle]!;
+    final leftShoulder = landmarks[PoseLandmarkType.leftShoulder]!;
+    final rightShoulder = landmarks[PoseLandmarkType.rightShoulder]!;
+    final nose = landmarks[PoseLandmarkType.nose]!;
 
     final feedback = <String>[];
 
     // 1. Knee Flexion Analysis
-    final leftKneeAngle = _calculateAngle(leftHip.x, leftHip.y, leftKnee.x, leftKnee.y, leftAnkle!.x, leftAnkle.y);
-    final rightKneeAngle = _calculateAngle(rightHip.x, rightHip.y, rightKnee.x, rightKnee.y, rightAnkle!.x, rightAnkle.y);
+    final leftKneeAngle = _calculateAngle(leftHip.x, leftHip.y, leftKnee.x, leftKnee.y, leftAnkle.x, leftAnkle.y);
+    final rightKneeAngle = _calculateAngle(rightHip.x, rightHip.y, rightKnee.x, rightKnee.y, rightAnkle.x, rightAnkle.y);
     final avgKneeAngle = (leftKneeAngle + rightKneeAngle) / 2;
 
     if (avgKneeAngle < IDEAL['knee_flexion'][0] - TOLERANCE['knee_flexion'] ||
@@ -217,13 +415,13 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       feedback.add("Sit deeper on your heels. Knee angle needs adjustment.");
     }
 
-    // 2. Hip-Heel Contact
+    // 2. Hip-Heel Contact (using available landmarks)
     final hipCenter = Point((leftHip.x + rightHip.x) / 2, (leftHip.y + rightHip.y) / 2);
-    final heelCenter = Point((leftHeel!.x + rightHeel!.x) / 2, (leftHeel.y + rightHeel.y) / 2);
-    final hipHeelDistance = _calculateDistance(hipCenter.x, hipCenter.y, heelCenter.x, heelCenter.y);
+    final ankleCenter = Point((leftAnkle.x + rightAnkle.x) / 2, (leftAnkle.y + rightAnkle.y) / 2);
+    final hipAnkleDistance = _calculateDistance(hipCenter.x, hipCenter.y, ankleCenter.x, ankleCenter.y);
 
-    if (hipHeelDistance > IDEAL['hip_heel_distance'] + TOLERANCE['hip_heel_distance']) {
-      feedback.add("Bring your hips closer to your heels.");
+    if (hipAnkleDistance > IDEAL['hip_heel_distance'] + TOLERANCE['hip_heel_distance']) {
+      feedback.add("Bring your hips closer to your ankles.");
     }
 
     // 3. Head Position
@@ -246,20 +444,11 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       feedback.add("Relax and level your shoulders.");
     }
 
-    // 6. Arm Position
-    if (leftWrist != null && rightWrist != null) {
-      final leftArm = _calculateDistance(leftShoulder.x, leftShoulder.y, leftWrist.x, leftWrist.y);
-      final rightArm = _calculateDistance(rightShoulder.x, rightShoulder.y, rightWrist.x, rightWrist.y);
-      final armRelaxation = (leftArm + rightArm) / 2;
-
-      if (armRelaxation > IDEAL['arm_relaxation'] + TOLERANCE['arm_relaxation']) {
-        feedback.add("Let your arms relax alongside your body.");
-      }
-    }
-
     // Update feedback
     if (feedback.isNotEmpty) {
-      _feedback = feedback.join("\n");
+      setState(() {
+        _feedback = feedback.join("\n");
+      });
       _speakFeedback(feedback.first);
     } else {
       _correctPoseCount++;
@@ -270,8 +459,10 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
         goodMsg = "Excellent! Keep going.";
       }
       
-      final breathMsg = "Now take slow, deep breaths. Inhale through your nose, exhale gently, and relax your body in this posture.";
-      _feedback = "$goodMsg\n$breathMsg";
+      final breathMsg = "Now take slow, deep breaths.";
+      setState(() {
+        _feedback = "$goodMsg\n$breathMsg";
+      });
       _speakFeedback("$goodMsg $breathMsg");
     }
   }
@@ -287,11 +478,11 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
   }
 
   void _speakFeedback(String text) {
-    if (!_soundEnabled) return;
+    if (!_soundEnabled || _flutterTts == null) return;
 
     final now = DateTime.now();
     if (now.difference(_lastTTSTime).inSeconds > 5 && text != _lastSpokenFeedback) {
-      _flutterTts?.speak(text);
+      _flutterTts!.speak(text);
       _lastTTSTime = now;
       _lastSpokenFeedback = text;
     }
@@ -299,9 +490,66 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
 
   @override
   Widget build(BuildContext context) {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
+    if (_hasError) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.error, color: Colors.red, size: 64),
+                const SizedBox(height: 20),
+                Text(
+                  _errorMessage,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() {
+                      _hasError = false;
+                      _errorMessage = "";
+                      _feedback = "Retrying...";
+                    });
+                    _initializeServices();
+                  },
+                  child: const Text("Retry"),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (!_cameraInitialized || _cameraController == null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(color: Colors.white),
+              const SizedBox(height: 20),
+              Text(
+                _feedback,
+                style: const TextStyle(color: Colors.white, fontSize: 16),
+                textAlign: TextAlign.center,
+              ),
+              if (_debugInfo.isNotEmpty) ...[
+                const SizedBox(height: 20),
+                Text(
+                  _debugInfo,
+                  style: const TextStyle(color: Colors.grey, fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+              ]
+            ],
+          ),
+        ),
       );
     }
 
@@ -335,6 +583,25 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
               painter: PosePainter(_poses),
             ),
           ),
+
+          // Debug info (top)
+          if (_debugInfo.isNotEmpty)
+            Positioned(
+              top: 20,
+              left: 20,
+              right: 20,
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.7),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  _debugInfo,
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+              ),
+            ),
 
           // Feedback Panel
           Positioned(
@@ -394,7 +661,7 @@ class PosePainter extends CustomPainter {
       
       // Draw landmarks
       for (final landmark in pose.landmarks.values) {
-        if (landmark.likelihood > 0.1) {
+        if (landmark.likelihood > 0.5) {
           canvas.drawCircle(
             Offset(landmark.x * size.width, landmark.y * size.height),
             6,
@@ -429,7 +696,7 @@ class PosePainter extends CustomPainter {
       final point2 = landmarks[connection[1]];
       
       if (point1 != null && point2 != null && 
-          point1.likelihood > 0.1 && point2.likelihood > 0.1) {
+          point1.likelihood > 0.5 && point2.likelihood > 0.5) {
         canvas.drawLine(
           Offset(point1.x * size.width, point1.y * size.height),
           Offset(point2.x * size.width, point2.y * size.height),
