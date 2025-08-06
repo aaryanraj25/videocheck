@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Child's Pose (Balasana) Detection</title>
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- MediaPipe CDN scripts -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.5/drawing_utils.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.5/camera_utils.js" defer></script>
+</head>
+<body>
+  <div class="container">
+    <h1>Child's Pose (Balasana) Detection</h1>
+
+    <div class="video-canvas-wrapper">
+      <!-- Hidden video feed -->
+      <video id="input_video" playsinline style="opacity:0;position:absolute;left:0;top:0;width:480px;height:360px;z-index:1;"></video>
+      <!-- Canvas for pose and feedback -->
+      <canvas id="output_canvas" width="640" height="480"></canvas>
+    </div>
+
+    <!-- Text feedback -->
+    <div id="feedback" class="feedback">Initializing...</div>
+
+    <!-- Toggle button for audio feedback -->
+    <div class="controls">
+      <button id="toggle-sound">Toggle Sound</button>
+    </div>
+  </div>
+
+  <!-- Your JS logic -->
+  <script src="script.js" defer></script>
+</body>
+</html>
