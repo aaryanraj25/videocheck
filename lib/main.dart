@@ -203,14 +203,40 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
         _currentCameraIndex = 0; // Use first available camera
       }
       
-      await _setupCamera(_currentCameraIndex);
+      // Try different image format groups for better compatibility
+      final formatGroups = [
+        ImageFormatGroup.nv21,
+        ImageFormatGroup.yuv420,
+        ImageFormatGroup.bgra8888,
+      ];
+      
+      bool cameraInitialized = false;
+      Exception? lastException;
+      
+      for (final formatGroup in formatGroups) {
+        try {
+          await _setupCameraWithFormat(_currentCameraIndex, formatGroup);
+          cameraInitialized = true;
+          setState(() {
+            _debugInfo += "\nCamera: Initialized with ${formatGroup.name} (${widget.cameras[_currentCameraIndex].lensDirection.name})";
+          });
+          break;
+        } catch (e) {
+          lastException = e as Exception?;
+          print("Failed to initialize camera with ${formatGroup.name}: $e");
+          continue;
+        }
+      }
+      
+      if (!cameraInitialized) {
+        throw lastException ?? Exception("Failed to initialize camera with any format");
+      }
       
       if (!mounted) return;
       
       _cameraInitialized = true;
       
       setState(() {
-        _debugInfo += "\nCamera: Initialized (${widget.cameras[_currentCameraIndex].lensDirection.name})";
         _feedback = "Ready! Position yourself in Child's Pose";
       });
       
@@ -221,6 +247,19 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
     } catch (e) {
       throw Exception("Failed to initialize camera: $e");
     }
+  }
+
+  Future<void> _setupCameraWithFormat(int cameraIndex, ImageFormatGroup formatGroup) async {
+    await _cameraController?.dispose();
+    
+    _cameraController = CameraController(
+      widget.cameras[cameraIndex],
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup: formatGroup,
+    );
+
+    await _cameraController!.initialize();
   }
 
   int _findCameraIndex(CameraLensDirection direction) {
@@ -239,7 +278,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       widget.cameras[cameraIndex],
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420, // Ensure compatible format
+      imageFormatGroup: ImageFormatGroup.nv21, // Use nv21 for better compatibility
     );
 
     await _cameraController!.initialize();
@@ -271,11 +310,35 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       
       _currentCameraIndex = nextIndex;
       
-      // Setup new camera
-      await _setupCamera(_currentCameraIndex);
+      // Try different formats for camera switching
+      final formatGroups = [
+        ImageFormatGroup.nv21,
+        ImageFormatGroup.yuv420,
+        ImageFormatGroup.bgra8888,
+      ];
+      
+      bool cameraInitialized = false;
+      Exception? lastException;
+      
+      for (final formatGroup in formatGroups) {
+        try {
+          await _setupCameraWithFormat(_currentCameraIndex, formatGroup);
+          cameraInitialized = true;
+          setState(() {
+            _debugInfo += "\nSwitched to: ${widget.cameras[_currentCameraIndex].lensDirection.name} (${formatGroup.name})";
+          });
+          break;
+        } catch (e) {
+          lastException = e as Exception?;
+          continue;
+        }
+      }
+      
+      if (!cameraInitialized) {
+        throw lastException ?? Exception("Failed to initialize new camera");
+      }
       
       setState(() {
-        _debugInfo += "\nSwitched to: ${widget.cameras[_currentCameraIndex].lensDirection.name}";
         _feedback = "Camera switched. Ready for Child's Pose";
       });
       
@@ -333,7 +396,7 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       if (mounted && poses != null) {
         setState(() {
           _poses = poses;
-          _debugInfo = "Poses detected: ${poses.length}";
+          _debugInfo = "Poses detected: ${poses.length} | Format: ${image.format.raw}";
         });
         
         _analyzePose();
@@ -343,8 +406,26 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       setState(() {
         _debugInfo += "\nProcessing error: $e";
       });
+      
+      // If we get repeated processing errors, try to restart the image stream
+      if (e.toString().contains('format') || e.toString().contains('null')) {
+        print('Image format error detected, attempting to restart image stream...');
+        _restartImageStreamWithDelay();
+      }
     } finally {
       _isProcessing = false;
+    }
+  }
+
+  void _restartImageStreamWithDelay() async {
+    try {
+      await _cameraController?.stopImageStream();
+      await Future.delayed(const Duration(milliseconds: 1000));
+      if (mounted && _cameraController != null && _cameraController!.value.isInitialized) {
+        _startImageStream();
+      }
+    } catch (e) {
+      print('Error restarting image stream: $e');
     }
   }
 
@@ -385,10 +466,37 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
         }
       }
 
-      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+      // Handle different image formats with fallback
+      InputImageFormat? format;
+      
+      // Try to get format from raw value
+      try {
+        format = InputImageFormatValue.fromRawValue(image.format.raw);
+      } catch (e) {
+        print('Failed to get format from raw value: $e');
+      }
+      
+      // If format is null, try common formats based on platform
       if (format == null) {
-        print('Unsupported image format: ${image.format.raw}');
-        return null;
+        // Common formats for Android/iOS
+        switch (image.format.raw) {
+          case 35: // ImageFormat.YUV_420_888 on Android
+            format = InputImageFormat.yuv420;
+            break;
+          case 17: // ImageFormat.NV21 on Android
+            format = InputImageFormat.nv21;
+            break;
+          case 842094169: // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange on iOS
+            format = InputImageFormat.yuv420;
+            break;
+          case 875704422: // kCVPixelFormatType_420YpCbCr8BiPlanarFullRange on iOS
+            format = InputImageFormat.yuv420;
+            break;
+          default:
+            print('Unsupported image format: ${image.format.raw}');
+            // Try to use YUV420 as fallback
+            format = InputImageFormat.yuv420;
+        }
       }
 
       if (image.planes.isEmpty) {
@@ -397,6 +505,12 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       }
 
       final plane = image.planes.first;
+      
+      // Validate plane data
+      if (plane.bytes.isEmpty) {
+        print('Empty plane bytes');
+        return null;
+      }
 
       return InputImage.fromBytes(
         bytes: plane.bytes,
@@ -409,6 +523,9 @@ class _ChildsPoseDetectionAppState extends State<ChildsPoseDetectionApp> {
       );
     } catch (e) {
       print('Error creating InputImage: $e');
+      setState(() {
+        _debugInfo += "\nInputImage error: $e";
+      });
       return null;
     }
   }
